@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Smart Home Elite - Dashboard</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/paho-mqtt/1.0.1/mqttws31.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;600;800&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --primary: #22d3ee; --secondary: #818cf8; --accent: #f472b6;
+            --bg: #020617; --card-bg: rgba(30, 41, 59, 0.7);
+            --text-main: #f8fafc; --text-dim: #94a3b8;
+            --success: #10b981; --danger: #f43f5e; --warning: #fbbf24;
+        }
+
+        * { box-sizing: border-box; transition: all 0.3s ease; }
+        body { 
+            font-family: 'Plus Jakarta Sans', sans-serif; 
+            background: radial-gradient(circle at top left, #0f172a, #020617);
+            color: var(--text-main); margin: 0; padding: 20px; min-height: 100vh;
+        }
+
+        .container { width: 100%; max-width: 1300px; margin: 0 auto; }
+        header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px; }
+        
+        .brand h1 { 
+            margin: 0; font-size: 2rem; font-weight: 800;
+            background: linear-gradient(to right, var(--primary), var(--secondary));
+            -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+        }
+
+        .status-bar {
+            display: flex; gap: 15px; align-items: center;
+            background: var(--card-bg); padding: 10px 20px; border-radius: 30px;
+            backdrop-filter: blur(10px); border: 1px solid rgba(255,255,255,0.1);
+        }
+
+        .dot { height: 10px; width: 10px; border-radius: 50%; display: inline-block; }
+        .dot-online { background-color: var(--success); box-shadow: 0 0 10px var(--success); }
+        .dot-offline { background-color: var(--danger); }
+
+        .grid { display: grid; grid-template-columns: repeat(12, 1fr); gap: 20px; }
+        .card { 
+            background: var(--card-bg); border-radius: 24px; padding: 20px;
+            backdrop-filter: blur(12px); border: 1px solid rgba(255,255,255,0.08);
+        }
+
+        /* Phân bổ Grid */
+        .col-camera { grid-column: span 8; }
+        .col-stats { grid-column: span 4; }
+        .col-controls { grid-column: span 4; }
+        .col-security { grid-column: span 4; }
+        .col-photo { grid-column: span 4; }
+        .col-alerts { grid-column: span 12; } /* Phần cảnh báo rộng toàn màn hình phía dưới */
+
+        .stream-wrapper { width: 100%; aspect-ratio: 16/9; background: #000; border-radius: 18px; overflow: hidden; border: 2px solid #334155; }
+        #stream-view { width: 100%; height: 100%; object-fit: cover; }
+
+        .btn { padding: 12px 24px; border-radius: 12px; border: none; cursor: pointer; font-weight: 700; display: flex; align-items: center; gap: 8px; justify-content: center; width: 100%; }
+        .btn-primary { background: linear-gradient(135deg, var(--secondary), var(--primary)); color: white; }
+        .btn-danger { background: var(--danger); color: white; margin-top: 15px; }
+
+        .device-row { display: flex; justify-content: space-between; align-items: center; padding: 12px 0; border-bottom: 1px solid rgba(255,255,255,0.05); }
+        .sensor-value { font-size: 2.2rem; font-weight: 800; text-align: center; margin: 5px 0; }
+        .unit { font-size: 0.9rem; color: var(--text-dim); margin-left: 5px; }
+
+        .switch { position: relative; width: 50px; height: 26px; }
+        .switch input { opacity: 0; width: 0; height: 0; }
+        .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #334155; border-radius: 34px; }
+        .slider:before { position: absolute; content: ""; height: 18px; width: 18px; left: 4px; bottom: 4px; background-color: white; border-radius: 50%; transition: 0.4s; }
+        input:checked + .slider { background: var(--primary); }
+        input:checked + .slider:before { transform: translateX(24px); }
+
+        /* Style cho danh sách cảnh báo */
+        #alert-list { max-height: 200px; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; padding-right: 10px; }
+        .alert-item { 
+            padding: 12px 15px; border-radius: 12px; background: rgba(15, 23, 42, 0.5);
+            border-left: 4px solid var(--primary); display: flex; justify-content: space-between; align-items: center;
+            animation: slideIn 0.3s ease-out;
+        }
+        .alert-danger { border-left-color: var(--danger); background: rgba(244, 63, 94, 0.1); }
+        .alert-time { font-size: 0.8rem; color: var(--text-dim); }
+
+        @keyframes slideIn { from { opacity: 0; transform: translateY(-10px); } to { opacity: 1; transform: translateY(0); } }
+        @media (max-width: 1024px) { .col-camera, .col-stats, .col-controls, .col-photo, .col-security, .col-alerts { grid-column: span 12; } }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <header>
+        <div class="brand">
+            <h1><i class="fas fa-house-shield"></i> SMART HOME ELITE</h1>
+            <p id="clock" style="color: var(--text-dim); margin-top: 5px;"></p>
+        </div>
+        <div class="status-bar">
+            <span id="mqtt-dot" class="dot dot-offline"></span>
+            <span id="mqtt-text" style="font-weight: 600;">DISCONNECTED</span>
+        </div>
+    </header>
+
+    <div class="grid">
+        <div class="card col-camera">
+            <div style="display: flex; justify-content: space-between; margin-bottom: 15px;">
+                <span style="font-weight: 700; color: var(--text-dim)"><i class="fas fa-video"></i> LIVE FEED</span>
+                <span id="ip-tag" style="font-size: 0.8rem; color: var(--primary);">Waiting for IP...</span>
+            </div>
+            <div class="stream-wrapper">
+                <img id="stream-view" src="https://via.placeholder.com/800x450?text=Camera+Offline" alt="Stream">
+            </div>
+            <div style="margin-top: 15px; display: flex; gap: 10px;">
+                <input type="text" id="manual-ip" placeholder="Nhập IP ESP32-CAM..." style="flex:1; padding: 10px; border-radius: 8px; border: 1px solid #334155; background: #0f172a; color: white;">
+                <button class="btn btn-primary" style="width: auto;" onclick="setStreamIP(document.getElementById('manual-ip').value)">KẾT NỐI</button>
+            </div>
+        </div>
+
+        <div class="card col-stats">
+            <h3 style="margin-top: 0; color: var(--text-dim); font-size: 1rem;"><i class="fas fa-microchip"></i> THÔNG SỐ MÔI TRƯỜNG</h3>
+            
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; text-align: center;">
+                <div>
+                    <div class="unit">NHIỆT ĐỘ</div>
+                    <div class="sensor-value" id="temp-val" style="color: var(--primary);">--<span class="unit">°C</span></div>
+                </div>
+                <div>
+                    <div class="unit">ĐỘ ẨM</div>
+                    <div class="sensor-value" id="humi-val" style="color: var(--success);">--<span class="unit">%</span></div>
+                </div>
+            </div>
+
+            <div style="border-top: 1px solid rgba(255,255,255,0.1); padding-top: 20px; margin-top: 10px;">
+                <div class="unit" style="text-align: center;">CHỈ SỐ GAS / KHÓI</div>
+                <div class="sensor-value" id="gas-val" style="color: var(--accent);">--<span class="unit">PPM</span></div>
+            </div>
+        </div>
+
+        <div class="card col-controls">
+            <h3 style="margin-top: 0;"><i class="fas fa-lightbulb"></i> THIẾT BỊ</h3>
+            <div class="device-row">
+                <span>Đèn Phòng Khách</span>
+                <label class="switch">
+                    <input type="checkbox" onchange="controlDevice('led', this.checked)">
+                    <span class="slider"></span>
+                </label>
+            </div>
+            <div class="device-row">
+                <span>Quạt Gió</span>
+                <label class="switch">
+                    <input type="checkbox" onchange="controlDevice('fan', this.checked)">
+                    <span class="slider"></span>
+                </label>
+            </div>
+        </div>
+
+        <div class="card col-security">
+            <h3 style="margin-top: 0;"><i class="fas fa-shield-alt"></i> AN NINH</h3>
+            <div class="device-row" style="background: rgba(244, 63, 94, 0.1); border-radius: 12px; padding: 10px; margin-bottom: 10px;">
+                <span>CHẾ ĐỘ BẢO VỆ</span>
+                <label class="switch">
+                    <input type="checkbox" id="arm-switch" onchange="toggleSecurity(this.checked)">
+                    <span class="slider"></span>
+                </label>
+            </div>
+            <button class="btn btn-danger" onclick="stopBuzzer()">
+                <i class="fas fa-volume-mute"></i> TẮT CÒI KHẨN CẤP
+            </button>
+        </div>
+
+        <div class="card col-photo">
+            <h3 style="margin-top: 0;"><i class="fas fa-camera"></i> SNAPSHOT</h3>
+            <img id="photo-view" src="https://via.placeholder.com/400x300?text=No+Event" style="width: 100%; border-radius: 12px; margin-bottom: 10px; aspect-ratio: 4/3; object-fit: cover;">
+            <button class="btn btn-primary" onclick="triggerCapture()"><i class="fas fa-camera-retro"></i> CHỤP NGAY</button>
+        </div>
+
+        <div class="card col-alerts">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+                <h3 style="margin: 0;"><i class="fas fa-bell"></i> NHẬT KÝ CẢNH BÁO HỆ THỐNG</h3>
+                <button onclick="document.getElementById('alert-list').innerHTML=''" style="background:none; border:none; color:var(--text-dim); cursor:pointer; font-size: 0.8rem;">Xóa lịch sử</button>
+            </div>
+            <div id="alert-list">
+                <div class="alert-item">
+                    <span>Hệ thống đã sẵn sàng kết nối...</span>
+                    <span class="alert-time">Bắt đầu</span>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+    const broker = "broker.emqx.io";
+    const clientId = "WebClient_" + Math.random().toString(16).substr(2, 8);
+    const client = new Paho.MQTT.Client(broker, 8083, clientId);
+
+    // Hàm thêm thông báo vào danh sách phía dưới
+    function addAlert(message, isDanger = false) {
+        const list = document.getElementById("alert-list");
+        const time = new Date().toLocaleTimeString('vi-VN');
+        const item = document.createElement("div");
+        item.className = `alert-item ${isDanger ? 'alert-danger' : ''}`;
+        item.innerHTML = `
+            <span><i class="fas ${isDanger ? 'fa-exclamation-triangle' : 'fa-info-circle'}"></i> ${message}</span>
+            <span class="alert-time">${time}</span>
+        `;
+        list.prepend(item); // Thêm lên đầu danh sách
+    }
+
+    client.onMessageArrived = (msg) => {
+        const topic = msg.destinationName;
+        const payload = msg.payloadString;
+
+        if (topic === "home/camera/ip") {
+            document.getElementById("ip-tag").innerText = "IP: " + payload;
+            setStreamIP(payload);
+        } else if (topic === "home/camera/photo") {
+            const blob = new Blob([msg.payloadBytes], { type: "image/jpeg" });
+            document.getElementById("photo-view").src = URL.createObjectURL(blob);
+            addAlert("Đã cập nhật ảnh từ camera");
+        } else if (topic === "home/sensor/temp") {
+            document.getElementById("temp-val").innerHTML = payload + '<span class="unit">°C</span>';
+        } else if (topic === "home/sensor/humi") {
+            document.getElementById("humi-val").innerHTML = payload + '<span class="unit">%</span>';
+        } else if (topic === "home/sensor/gas") {
+            document.getElementById("gas-val").innerHTML = payload + '<span class="unit">PPM</span>';
+            if(parseInt(payload) > 2000) {
+                document.getElementById("gas-val").style.color = "var(--danger)";
+            } else {
+                document.getElementById("gas-val").style.color = "var(--accent)";
+            }
+        } else if (topic === "home/notification") {
+            if (payload === "GAS_DANGER") {
+                addAlert("CẢNH BÁO: Phát hiện rò rỉ Gas vượt ngưỡng!", true);
+            }
+            if (payload === "INTRUDER_ALERT") {
+                addAlert("CẢNH BÁO: Phát hiện có kẻ đột nhập trái phép!", true);
+            }
+        }
+    };
+
+    client.connect({ 
+        onSuccess: () => {
+            document.getElementById("mqtt-dot").className = "dot dot-online";
+            document.getElementById("mqtt-text").innerText = "SYSTEM ONLINE";
+            client.subscribe("home/camera/ip");
+            client.subscribe("home/camera/photo");
+            client.subscribe("home/sensor/temp");
+            client.subscribe("home/sensor/humi"); // Subscribe thêm độ ẩm
+            client.subscribe("home/sensor/gas");
+            client.subscribe("home/notification");
+            addAlert("Đã kết nối thành công tới MQTT Broker");
+        },
+        useSSL: false 
+    });
+
+    function setStreamIP(ip) {
+        if(!ip) return;
+        document.getElementById("stream-view").src = "http://" + ip + "/";
+        document.getElementById("manual-ip").value = ip;
+    }
+
+    function controlDevice(device, state) {
+        const msg = new Paho.MQTT.Message(state ? "ON" : "OFF");
+        msg.destinationName = "home/" + device + "/control";
+        client.send(msg);
+        addAlert(`Đã gửi lệnh ${state ? 'BẬT' : 'TẮT'} cho ${device}`);
+    }
+
+    function toggleSecurity(state) {
+        const msg = new Paho.MQTT.Message(state ? "ARM_ON" : "ARM_OFF");
+        msg.destinationName = "home/security/mode";
+        client.send(msg);
+        addAlert(`Chế độ an ninh: ${state ? 'KÍCH HOẠT' : 'VÔ HIỆU'}`);
+    }
+
+    function stopBuzzer() {
+        const msg = new Paho.MQTT.Message("OFF");
+        msg.destinationName = "home/buzzer/control";
+        client.send(msg);
+        addAlert("Đã gửi lệnh tắt còi khẩn cấp");
+    }
+
+    function triggerCapture() {
+        const msg = new Paho.MQTT.Message("CAPTURE");
+        msg.destinationName = "home/camera/trigger";
+        client.send(msg);
+        addAlert("Đang yêu cầu chụp ảnh...");
+    }
+
+    setInterval(() => {
+        document.getElementById("clock").innerText = new Date().toLocaleString('vi-VN');
+    }, 1000);
+</script>
+</body>
+</html>
