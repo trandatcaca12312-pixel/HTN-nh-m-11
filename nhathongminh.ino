@@ -15,7 +15,7 @@ const char* ntpServer = "pool.ntp.org";
 const long  gmtOffset_sec = 7 * 3600;
 const int   daylightOffset_sec = 0;
 
-// --- Định nghĩa chân Pin (Bản ổn định) ---
+// --- Định nghĩa chân Pin  ---
 #define SS_PIN 17          
 #define RST_PIN 22
 #define PIR_PIN 13
@@ -147,7 +147,7 @@ void Task_Hardware(void *pvParameters) {
       mfrc522.PCD_StopCrypto1();
     }
 
-    // 3. Đọc cảm biến định kỳ (Cập nhật đọc thêm độ ẩm)
+    // 3. Đọc cảm biến định kỳ 
     if (millis() - lastSensorRead > 10000) {
       float temp = dht.readTemperature();
       float humi = dht.readHumidity();
