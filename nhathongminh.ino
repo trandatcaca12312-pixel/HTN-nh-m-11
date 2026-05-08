@@ -3,114 +3,110 @@
 #include <SPI.h>
 #include <MFRC522.h>
 #include <DHT.h>
+#include <ESP32Servo.h> 
 #include "time.h"
 
-// --- Cấu hình Wi-Fi & MQTT ---
-const char* ssid = "DESKTOP-T6EL1QE 8451";
-const char* password = "7[89Z20z";
-const char* mqtt_server = "broker.emqx.io";
-
-// --- Cấu hình NTP ---
-const char* ntpServer = "pool.ntp.org";
-const long  gmtOffset_sec = 7 * 3600;
-const int   daylightOffset_sec = 0;
-
-// --- Định nghĩa chân Pin  ---
+// --- Pin Definitions ---
 #define SS_PIN 17          
 #define RST_PIN 22
 #define PIR_PIN 13
 #define DHTPIN 21          
 #define GAS_PIN 34
 #define RELAY_DOOR 16      
+#define SERVO_PIN 4      
 #define LED_PIN 14
 #define FAN_PIN 26         
 #define BUZZER_PIN 25      
-#define GAS_THRESHOLD 2000 
+
+// --- Cấu hình ---
+const char* ssid = "DESKTOP-T6EL1QE 8451";
+const char* password = "7[89Z20z";
+const char* mqtt_server = "broker.emqx.io";
+const int GAS_THRESHOLD = 2000;
 
 DHT dht(DHTPIN, DHT22);
 MFRC522 mfrc522(SS_PIN, RST_PIN);
+Servo doorServo;
 WiFiClient espClient;
 PubSubClient client(espClient);
 
-// --- Biến hệ thống ---
-QueueHandle_t sensorQueue;
-QueueHandle_t securityQueue;
+struct SensorData { float temp, humi; int gas; };
+QueueHandle_t sensorQueue, securityQueue;
 
-// Thêm biến humi vào struct
-struct SensorData { 
-  float temp; 
-  float humi; 
-  int gas; 
-};
+bool isArmed = false;
+unsigned long doorTimer = 0;
+bool isDoorOpen = false; 
 
-bool isArmed = false; 
-int schHour = -1, schMin = -1;
-bool schActive = false;
+// --- Hàm điều khiển Cửa ---
+void controlDoor(bool open) {
+  if (open) {
+    if (!isDoorOpen) { 
+      isDoorOpen = true;
+      doorServo.attach(SERVO_PIN); 
+      digitalWrite(RELAY_DOOR, HIGH);
+      doorServo.write(90);        
+      client.publish("home/door/status", "OPEN");
+      doorTimer = millis();       
+      Serial.println("Cửa mở...");
+    }
+  } else {
+    if (isDoorOpen) { 
+      isDoorOpen = false;
+      digitalWrite(RELAY_DOOR, LOW);
+      doorServo.write(0);         
+      client.publish("home/door/status", "CLOSED");
+      Serial.println("Cửa đóng...");
+      
+      vTaskDelay(pdMS_TO_TICKS(600)); 
+      doorServo.detach(); 
+    }
+  }
+}
 
 // --- Xử lý lệnh từ MQTT ---
 void callback(char* topic, byte* payload, unsigned int length) {
   String msg = "";
   for (int i = 0; i < length; i++) msg += (char)payload[i];
   String strTopic = String(topic);
-  
-  if (strTopic == "home/led/control") {
+
+  if (strTopic == "home/door/control" && msg == "OPEN") {
+    controlDoor(true);
+  } else if (strTopic == "home/led/control") {
     digitalWrite(LED_PIN, (msg == "ON") ? HIGH : LOW);
-  } 
-  else if (strTopic == "home/fan/control") {
+  } else if (strTopic == "home/fan/control") {
     digitalWrite(FAN_PIN, (msg == "ON") ? HIGH : LOW);
-  }
-  else if (strTopic == "home/security/mode") {
-    isArmed = (msg == "ARM_ON"); 
+  } else if (strTopic == "home/security/mode") {
+    isArmed = (msg == "ARM_ON");
     if (!isArmed) digitalWrite(BUZZER_PIN, LOW);
-  }
-  else if (strTopic == "home/buzzer/control") {
-    if (msg == "OFF") digitalWrite(BUZZER_PIN, LOW); 
-  }
-  else if (strTopic == "home/timer/set") {
-    schHour = msg.substring(0, 2).toInt();
-    schMin = msg.substring(3, 5).toInt();
-    schActive = true;
+  } else if (strTopic == "home/buzzer/control" && msg == "OFF") {
+    digitalWrite(BUZZER_PIN, LOW);
   }
 }
 
 // --- Task Mạng (Core 0) ---
 void Task_Network(void *pvParameters) {
-  SensorData receivedData;
   for (;;) {
     if (WiFi.status() != WL_CONNECTED) {
       WiFi.begin(ssid, password);
       vTaskDelay(pdMS_TO_TICKS(5000));
     } else {
       if (!client.connected()) {
-        String clientId = "ESP32-Master-" + String(random(0xffff), HEX);
-        if (client.connect(clientId.c_str())) {
-          client.subscribe("home/led/control");
-          client.subscribe("home/fan/control");
-          client.subscribe("home/timer/set");
+        if (client.connect("ESP32_SmartHome_Final")) {
+          client.subscribe("home/+/control");
           client.subscribe("home/security/mode");
-          client.subscribe("home/buzzer/control");
-          Serial.println("MQTT Connected");
         }
       }
       if (client.connected()) {
         client.loop();
-        // Nhận dữ liệu từ Queue và gửi lên MQTT
+        SensorData receivedData;
         if (xQueueReceive(sensorQueue, &receivedData, 0) == pdPASS) {
-          char t[8], h[8], g[8];
-          dtostrf(receivedData.temp, 1, 2, t);
-          dtostrf(receivedData.humi, 1, 2, h); // Chuyển đổi độ ẩm
-          itoa(receivedData.gas, g, 10);
-          
-          client.publish("home/sensor/temp", t);
-          client.publish("home/sensor/humi", h); // Publish độ ẩm lên topic riêng
-          client.publish("home/sensor/gas", g);
+          client.publish("home/sensor/temp", String(receivedData.temp).c_str());
+          client.publish("home/sensor/humi", String(receivedData.humi).c_str());
+          client.publish("home/sensor/gas", String(receivedData.gas).c_str());
         }
-        
-        char* securityMsg;
-        if (xQueueReceive(securityQueue, &securityMsg, 0) == pdPASS) {
-          if (String(securityMsg) == "TRIGGER_CAM") client.publish("home/camera/trigger", "CAPTURE");
-          if (String(securityMsg) == "GAS_ALARM") client.publish("home/notification", "GAS_DANGER");
-          if (String(securityMsg) == "INTRUDER") client.publish("home/notification", "INTRUDER_ALERT");
+        char* secMsg;
+        if (xQueueReceive(securityQueue, &secMsg, 0) == pdPASS) {
+          client.publish("home/notification", secMsg);
         }
       }
     }
@@ -120,61 +116,51 @@ void Task_Network(void *pvParameters) {
 
 // --- Task Phần cứng (Core 1) ---
 void Task_Hardware(void *pvParameters) {
-  SensorData sData;
-  unsigned long lastSensorRead = 0;
-  struct tm timeinfo;
-
+  unsigned long lastRead = 0;
   for (;;) {
-    // 1. Kiểm tra PIR
-    if (digitalRead(PIR_PIN) == HIGH) {
-      if (isArmed) {
-        digitalWrite(BUZZER_PIN, HIGH);
-        char* msg = "INTRUDER";
-        xQueueSend(securityQueue, &msg, 0);
-      }
-      char* camMsg = "TRIGGER_CAM";
-      xQueueSend(securityQueue, &camMsg, 0);
-      vTaskDelay(pdMS_TO_TICKS(5000));
-    }
-
-    // 2. Kiểm tra RFID
+    // 1. Quét RFID
     if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) {
-      digitalWrite(RELAY_DOOR, HIGH);
-      digitalWrite(BUZZER_PIN, LOW); 
-      vTaskDelay(pdMS_TO_TICKS(3000));
-      digitalWrite(RELAY_DOOR, LOW);
+      controlDoor(true);
       mfrc522.PICC_HaltA();
       mfrc522.PCD_StopCrypto1();
     }
 
-    // 3. Đọc cảm biến định kỳ 
-    if (millis() - lastSensorRead > 10000) {
-      float temp = dht.readTemperature();
-      float humi = dht.readHumidity();
-      int gas = analogRead(GAS_PIN);
-
-      if (!isnan(temp) && !isnan(humi)) {
-        sData.temp = temp;
-        sData.humi = humi;
-        sData.gas = gas;
-        
-        if (sData.gas > GAS_THRESHOLD) {
-          digitalWrite(BUZZER_PIN, HIGH);
-          char* gMsg = "GAS_ALARM";
-          xQueueSend(securityQueue, &gMsg, 0);
-        }
-        xQueueSend(sensorQueue, &sData, 0);
-      }
-      lastSensorRead = millis();
+    // 2. Tự động đóng cửa sau 3 giây 
+    if (isDoorOpen && (millis() - doorTimer > 3000)) {
+      controlDoor(false);
+      doorTimer = 0; 
     }
 
-    // 4. Kiểm tra hẹn giờ
-    if (schActive && getLocalTime(&timeinfo)) {
-      if (timeinfo.tm_hour == schHour && timeinfo.tm_min == schMin) {
-        digitalWrite(LED_PIN, LOW);
-        digitalWrite(FAN_PIN, LOW);
-        schActive = false;
+    // 3. PIR (Báo động đột nhập)
+    if (digitalRead(PIR_PIN) == HIGH && isArmed) {
+      digitalWrite(BUZZER_PIN, HIGH);
+      char* m = "INTRUDER ALERT!";
+      xQueueSend(securityQueue, &m, 0);
+      vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+
+    // 4. Đọc cảm biến Gas & DHT
+    if (millis() - lastRead > 10000) {
+      SensorData sData;
+      sData.temp = dht.readTemperature();
+      sData.humi = dht.readHumidity();
+      sData.gas = analogRead(GAS_PIN);
+
+      // --- PHẦN MỚI: Logic xử lý Gas tự động tắt còi ---
+      if (sData.gas > GAS_THRESHOLD) {
+        digitalWrite(BUZZER_PIN, HIGH);
+        char* g = "GAS LEAKAGE!";
+        xQueueSend(securityQueue, &g, 0);
+      } else {
+        // Tự động tắt còi nếu không còn gas và chế độ an ninh đang tắt
+        if (!isArmed) {
+          digitalWrite(BUZZER_PIN, LOW);
+        }
       }
+      
+
+      xQueueSend(sensorQueue, &sData, 0);
+      lastRead = millis();
     }
     vTaskDelay(pdMS_TO_TICKS(50));
   }
@@ -182,19 +168,18 @@ void Task_Hardware(void *pvParameters) {
 
 void setup() {
   Serial.begin(115200);
-  delay(1000); 
-  Serial.println("System starting with Humidity Support...");
-
-  pinMode(PIR_PIN, INPUT);
   pinMode(RELAY_DOOR, OUTPUT);
   pinMode(LED_PIN, OUTPUT);
   pinMode(FAN_PIN, OUTPUT);
   pinMode(BUZZER_PIN, OUTPUT);
-  
-  digitalWrite(RELAY_DOOR, LOW);
-  digitalWrite(LED_PIN, LOW);
-  digitalWrite(FAN_PIN, LOW);
-  digitalWrite(BUZZER_PIN, LOW);
+  pinMode(PIR_PIN, INPUT);
+
+  // Khởi tạo Servo ban đầu ở trạng thái đóng
+  doorServo.setPeriodHertz(50); 
+  doorServo.attach(SERVO_PIN);
+  doorServo.write(0); 
+  vTaskDelay(pdMS_TO_TICKS(500));
+  doorServo.detach(); 
 
   SPI.begin();
   mfrc522.PCD_Init();
@@ -205,12 +190,13 @@ void setup() {
 
   client.setServer(mqtt_server, 1883);
   client.setCallback(callback);
-  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
 
-  xTaskCreatePinnedToCore(Task_Network, "Network", 8192, NULL, 2, NULL, 0);
-  xTaskCreatePinnedToCore(Task_Hardware, "Hardware", 4096, NULL, 3, NULL, 1);
+  xTaskCreatePinnedToCore(Task_Network, "Net", 8192, NULL, 2, NULL, 0);
+  xTaskCreatePinnedToCore(Task_Hardware, "Hw", 4096, NULL, 3, NULL, 1);
   
-  Serial.println("System Ready!");
+  Serial.println("Hệ thống đã sẵn sàng!");
 }
 
-void loop() {}
+void loop() {
+  // FreeRTOS xử lý mọi thứ trong Tasks, loop để trống.
+}
