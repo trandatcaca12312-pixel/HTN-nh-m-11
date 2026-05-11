@@ -24,6 +24,11 @@ const char* password = "7[89Z20z";
 const char* mqtt_server = "broker.emqx.io";
 const int GAS_THRESHOLD = 2000;
 
+// Cấu hình thời gian (NTP)
+const char* ntpServer = "pool.ntp.org";
+const long  gmtOffset_sec = 7 * 3600; 
+const int   daylightOffset_sec = 0;
+
 DHT dht(DHTPIN, DHT22);
 MFRC522 mfrc522(SS_PIN, RST_PIN);
 Servo doorServo;
@@ -35,14 +40,16 @@ QueueHandle_t sensorQueue, securityQueue;
 
 bool isArmed = false;
 unsigned long doorTimer = 0;
-bool isDoorOpen = false; 
+bool isDoorOpen = false;
 
-// --- Hàm điều khiển Cửa ---
+int lightTimerH = -1, lightTimerM = -1;
+int fanTimerH = -1, fanTimerM = -1;
+
 void controlDoor(bool open) {
   if (open) {
     if (!isDoorOpen) { 
       isDoorOpen = true;
-      doorServo.attach(SERVO_PIN); 
+      doorServo.attach(SERVO_PIN);
       digitalWrite(RELAY_DOOR, HIGH);
       doorServo.write(90);        
       client.publish("home/door/status", "OPEN");
@@ -56,14 +63,12 @@ void controlDoor(bool open) {
       doorServo.write(0);         
       client.publish("home/door/status", "CLOSED");
       Serial.println("Cửa đóng...");
-      
       vTaskDelay(pdMS_TO_TICKS(600)); 
       doorServo.detach(); 
     }
   }
 }
 
-// --- Xử lý lệnh từ MQTT ---
 void callback(char* topic, byte* payload, unsigned int length) {
   String msg = "";
   for (int i = 0; i < length; i++) msg += (char)payload[i];
@@ -80,10 +85,15 @@ void callback(char* topic, byte* payload, unsigned int length) {
     if (!isArmed) digitalWrite(BUZZER_PIN, LOW);
   } else if (strTopic == "home/buzzer/control" && msg == "OFF") {
     digitalWrite(BUZZER_PIN, LOW);
+  } else if (strTopic == "home/led/timer") {
+    lightTimerH = msg.substring(0, 2).toInt();
+    lightTimerM = msg.substring(3, 5).toInt();
+  } else if (strTopic == "home/fan/timer") {
+    fanTimerH = msg.substring(0, 2).toInt();
+    fanTimerM = msg.substring(3, 5).toInt();
   }
 }
 
-// --- Task Mạng (Core 0) ---
 void Task_Network(void *pvParameters) {
   for (;;) {
     if (WiFi.status() != WL_CONNECTED) {
@@ -94,6 +104,7 @@ void Task_Network(void *pvParameters) {
         if (client.connect("ESP32_SmartHome_Final")) {
           client.subscribe("home/+/control");
           client.subscribe("home/security/mode");
+          client.subscribe("home/+/timer");
         }
       }
       if (client.connected()) {
@@ -114,24 +125,20 @@ void Task_Network(void *pvParameters) {
   }
 }
 
-// --- Task Phần cứng (Core 1) ---
 void Task_Hardware(void *pvParameters) {
   unsigned long lastRead = 0;
+  struct tm timeinfo;
   for (;;) {
-    // 1. Quét RFID
     if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) {
       controlDoor(true);
       mfrc522.PICC_HaltA();
       mfrc522.PCD_StopCrypto1();
     }
 
-    // 2. Tự động đóng cửa sau 3 giây 
     if (isDoorOpen && (millis() - doorTimer > 3000)) {
       controlDoor(false);
-      doorTimer = 0; 
     }
 
-    // 3. PIR (Báo động đột nhập)
     if (digitalRead(PIR_PIN) == HIGH && isArmed) {
       digitalWrite(BUZZER_PIN, HIGH);
       char* m = "INTRUDER ALERT!";
@@ -139,26 +146,34 @@ void Task_Hardware(void *pvParameters) {
       vTaskDelay(pdMS_TO_TICKS(2000));
     }
 
-    // 4. Đọc cảm biến Gas & DHT
+    if (getLocalTime(&timeinfo)) {
+      if (timeinfo.tm_hour == lightTimerH && timeinfo.tm_min == lightTimerM) {
+        digitalWrite(LED_PIN, HIGH);
+        lightTimerH = -1;
+        char* tL = "TIMER: Đèn đã bật";
+        xQueueSend(securityQueue, &tL, 0);
+      }
+      if (timeinfo.tm_hour == fanTimerH && timeinfo.tm_min == fanTimerM) {
+        digitalWrite(FAN_PIN, HIGH);
+        fanTimerH = -1; 
+        char* tF = "TIMER: Quạt đã bật";
+        xQueueSend(securityQueue, &tF, 0);
+      }
+    }
+
     if (millis() - lastRead > 10000) {
       SensorData sData;
       sData.temp = dht.readTemperature();
       sData.humi = dht.readHumidity();
       sData.gas = analogRead(GAS_PIN);
 
-      // --- PHẦN MỚI: Logic xử lý Gas tự động tắt còi ---
       if (sData.gas > GAS_THRESHOLD) {
         digitalWrite(BUZZER_PIN, HIGH);
         char* g = "GAS LEAKAGE!";
         xQueueSend(securityQueue, &g, 0);
-      } else {
-        // Tự động tắt còi nếu không còn gas và chế độ an ninh đang tắt
-        if (!isArmed) {
-          digitalWrite(BUZZER_PIN, LOW);
-        }
+      } else if (!isArmed) {
+        digitalWrite(BUZZER_PIN, LOW);
       }
-      
-
       xQueueSend(sensorQueue, &sData, 0);
       lastRead = millis();
     }
@@ -174,29 +189,28 @@ void setup() {
   pinMode(BUZZER_PIN, OUTPUT);
   pinMode(PIR_PIN, INPUT);
 
-  // Khởi tạo Servo ban đầu ở trạng thái đóng
   doorServo.setPeriodHertz(50); 
   doorServo.attach(SERVO_PIN);
   doorServo.write(0); 
   vTaskDelay(pdMS_TO_TICKS(500));
-  doorServo.detach(); 
+  doorServo.detach();
 
   SPI.begin();
   mfrc522.PCD_Init();
   dht.begin();
+  
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
 
   sensorQueue = xQueueCreate(10, sizeof(SensorData));
   securityQueue = xQueueCreate(10, sizeof(char*));
 
   client.setServer(mqtt_server, 1883);
   client.setCallback(callback);
-
+  
   xTaskCreatePinnedToCore(Task_Network, "Net", 8192, NULL, 2, NULL, 0);
   xTaskCreatePinnedToCore(Task_Hardware, "Hw", 4096, NULL, 3, NULL, 1);
   
-  Serial.println("Hệ thống đã sẵn sàng!");
+  Serial.println("Hệ thống sẵn sàng!");
 }
 
-void loop() {
-  // FreeRTOS xử lý mọi thứ trong Tasks, loop để trống.
-}
+void loop() {}
