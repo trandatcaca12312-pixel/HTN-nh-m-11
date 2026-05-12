@@ -5,7 +5,7 @@
 #include <DHT.h>
 #include <ESP32Servo.h> 
 #include "time.h"
-
+#include "esp_camera.h"
 // --- Pin Definitions ---
 #define SS_PIN 17          
 #define RST_PIN 22
@@ -124,63 +124,108 @@ void Task_Network(void *pvParameters) {
     vTaskDelay(pdMS_TO_TICKS(100));
   }
 }
+static int motionCounter = 0;
+void captureAndSendPhoto() {
+  camera_fb_t * fb = esp_camera_fb_get();
+  if (!fb) return;
 
-void Task_Hardware(void *pvParameters) {
-  unsigned long lastRead = 0;
-  struct tm timeinfo;
-  for (;;) {
-    if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) {
-      controlDoor(true);
-      mfrc522.PICC_HaltA();
-      mfrc522.PCD_StopCrypto1();
-    }
-
-    if (isDoorOpen && (millis() - doorTimer > 3000)) {
-      controlDoor(false);
-    }
-
-    if (digitalRead(PIR_PIN) == HIGH && isArmed) {
-      digitalWrite(BUZZER_PIN, HIGH);
-      char* m = "INTRUDER ALERT!";
-      xQueueSend(securityQueue, &m, 0);
-      vTaskDelay(pdMS_TO_TICKS(2000));
-    }
-
-    if (getLocalTime(&timeinfo)) {
-      if (timeinfo.tm_hour == lightTimerH && timeinfo.tm_min == lightTimerM) {
-        digitalWrite(LED_PIN, HIGH);
-        lightTimerH = -1;
-        char* tL = "TIMER: Đèn đã bật";
-        xQueueSend(securityQueue, &tL, 0);
-      }
-      if (timeinfo.tm_hour == fanTimerH && timeinfo.tm_min == fanTimerM) {
-        digitalWrite(FAN_PIN, HIGH);
-        fanTimerH = -1; 
-        char* tF = "TIMER: Quạt đã bật";
-        xQueueSend(securityQueue, &tF, 0);
-      }
-    }
-
-    if (millis() - lastRead > 10000) {
-      SensorData sData;
-      sData.temp = dht.readTemperature();
-      sData.humi = dht.readHumidity();
-      sData.gas = analogRead(GAS_PIN);
-
-      if (sData.gas > GAS_THRESHOLD) {
-        digitalWrite(BUZZER_PIN, HIGH);
-        char* g = "GAS LEAKAGE!";
-        xQueueSend(securityQueue, &g, 0);
-      } else if (!isArmed) {
-        digitalWrite(BUZZER_PIN, LOW);
-      }
-      xQueueSend(sensorQueue, &sData, 0);
-      lastRead = millis();
-    }
-    vTaskDelay(pdMS_TO_TICKS(50));
+  if (client.beginPublish("home/camera/photo", fb->len, false)) {
+    client.write(fb->buf, fb->len);
+    client.endPublish();
+    Serial.println("Photo sent to MQTT!");
   }
+  esp_camera_fb_return(fb);
 }
+void Task_Hardware(void *pvParameters) {
+    unsigned long lastRead = 0;
+    struct tm timeinfo;
 
+    for (;;) {
+        // 1. KIỂM TRA RFID (Mở cửa bằng thẻ)
+        if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) {
+            controlDoor(true);
+            mfrc522.PICC_HaltA();
+            mfrc522.PCD_StopCrypto1();
+        }
+
+        // 2. TỰ ĐỘNG ĐÓNG CỬA 
+        if (isDoorOpen && (millis() - doorTimer > 3000)) {
+            controlDoor(false);
+        }
+
+        // 3. HỆ THỐNG BÁO ĐỘNG 
+       
+if (isArmed) {
+    if (digitalRead(PIR_PIN) == HIGH) {
+        motionCounter++;
+        vTaskDelay(pdMS_TO_TICKS(100)); 
+    } else {
+        if (motionCounter > 0) motionCounter--; 
+    }
+
+    if (motionCounter >= 5) {
+        digitalWrite(BUZZER_PIN, HIGH); // Bật còi báo động 
+
+        
+        // 1. Gửi lệnh đổi trạng thái thanh "AN NINH" 
+        client.publish("home/sensor/pir", "MOTION_DETECTED"); 
+        
+        // 2. Gọi hàm chụp ảnh để gửi lên Dashboard 
+        captureAndSendPhoto(); 
+        // ---------------------
+
+        char* m = "INTRUDER ALERT!"; 
+        xQueueSend(securityQueue, &m, 0); // Gửi thông báo vào Alert Box 
+        
+        motionCounter = 0; 
+        vTaskDelay(pdMS_TO_TICKS(5000)); // Chờ 5 giây 
+    }
+}
+          
+        // 4. HẸN GIỜ BẬT ĐÈN/QUẠT 
+        if (getLocalTime(&timeinfo)) {
+            // Hẹn giờ Đèn
+            if (timeinfo.tm_hour == lightTimerH && timeinfo.tm_min == lightTimerM) {
+                digitalWrite(LED_PIN, HIGH);
+                lightTimerH = -1; // Tắt hẹn giờ sau khi thực hiện
+                char* tL = "TIMER: Đèn đã bật";
+                xQueueSend(securityQueue, &tL, 0);
+            }
+            // Hẹn giờ Quạt
+            if (timeinfo.tm_hour == fanTimerH && timeinfo.tm_min == fanTimerM) {
+                digitalWrite(FAN_PIN, HIGH);
+                fanTimerH = -1; 
+                char* tF = "TIMER: Quạt đã bật";
+                xQueueSend(securityQueue, &tF, 0);
+            }
+        }
+
+        // 5. ĐỌC CẢM BIẾN (Nhiệt độ, Độ ẩm, Gas
+        if (millis() - lastRead > 10000) {
+            SensorData sData;
+            sData.temp = dht.readTemperature();
+            sData.humi = dht.readHumidity();
+            sData.gas = analogRead(GAS_PIN);
+
+            // Kiểm tra rò rỉ Gas
+            if (sData.gas > GAS_THRESHOLD) {
+                digitalWrite(BUZZER_PIN, HIGH);
+                char* g = "GAS LEAKAGE!";
+                xQueueSend(securityQueue, &g, 0);
+            } else if (!isArmed) {
+                // Chỉ tắt còi nếu không trong chế độ báo động chống trộm
+                digitalWrite(BUZZER_PIN, LOW);
+            }
+
+            
+            xQueueSend(sensorQueue, &sData, 0);
+            lastRead = millis();
+        }
+
+        
+        vTaskDelay(pdMS_TO_TICKS(50));
+    } 
+} 
 void setup() {
   Serial.begin(115200);
   pinMode(RELAY_DOOR, OUTPUT);
